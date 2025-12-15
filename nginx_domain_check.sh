@@ -2,7 +2,7 @@
 
 # ================= 配置区 =================
 # 你的 Nginx 配置目录
-NGINX_ROOT="/usr/local/nginx/conf/"
+NGINX_ROOT="/usr/local/nginx/conf/conf.d/"
 TIMEOUT=3
 # =========================================
 
