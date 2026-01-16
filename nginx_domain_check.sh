@@ -64,7 +64,7 @@ DOMAIN_LIST=$(nginx -T 2>/dev/null \
     | sed 's/server_name//g; s/;//g; s/{//g' \
     | tr ' ' '\n' \
     | sort -u \
-    | grep -vE "^$|localhost|on|off|_|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+")
+    | grep -vE "^$|^localhost$|\bon\b|\boff\b|^_$|^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
 
 LIST_OK=""
 LIST_FAIL=""
