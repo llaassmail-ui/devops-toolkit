@@ -1,190 +1,445 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# =========================================================
+# Nginx 域名与公网 IPv4 / IPv6 DNS 解析检查脚本
+# 适用于 Rocky Linux / CentOS / RHEL / Debian / Ubuntu
+# =========================================================
+
+set -u
 
 # ================= 配置区 =================
-# Nginx 配置目录，仅用于提示；实际域名通过 nginx -T 读取
-NGINX_ROOT="/usr/local/nginx/conf/"
-TIMEOUT=3
+
+# Nginx 可执行文件路径
+# 如果 nginx 已经在 PATH 中，保持 nginx 即可
+# 如果是源码安装，可以改成：
+# NGINX_BIN="/usr/local/nginx/sbin/nginx"
+NGINX_BIN="${NGINX_BIN:-nginx}"
+
+# curl 连接超时时间，单位：秒
+TIMEOUT="${TIMEOUT:-3}"
+
+# 公共 DNS 服务器
+DNS_IPV4="${DNS_IPV4:-1.1.1.1}"
+DNS_IPV6="${DNS_IPV6:-2606:4700:4700::1111}"
+
+# 获取公网 IP 的服务
+PUBLIC_IP_SERVICE="${PUBLIC_IP_SERVICE:-https://api.ipify.org}"
+
 # =========================================
 
-echo "[INFO] 正在探测服务器的多路公网 IP (IPv4 & IPv6)..."
+# -------------------------
+# 基础函数
+# -------------------------
 
-# 存储所有检测到的公网 IP，用于 DNS 比对
-DETECTED_IPS_STRING=""
-
-# ---------------------------------------------------------
-# 1. 探测 IPv4
-# ---------------------------------------------------------
-# 排除 lo、docker、veth、br、virbr 等虚拟网卡
-INTERNAL_IPS_V4=$(ip -o -4 addr show \
-    | grep -vE " lo |docker|veth|br-|virbr" \
-    | awk '{print $4}' \
-    | cut -d/ -f1)
-
-if [ -n "$INTERNAL_IPS_V4" ]; then
-    for INT_IP in $INTERNAL_IPS_V4; do
-        PUB_IP=$(curl --interface "$INT_IP" --connect-timeout "$TIMEOUT" -s -4 ifconfig.me)
-
-        if [ -n "$PUB_IP" ]; then
-            echo -e "[IPv4] 内网 $INT_IP \t--> 公网 $PUB_IP"
-            DETECTED_IPS_STRING="$DETECTED_IPS_STRING $PUB_IP"
-        fi
-    done
-fi
-
-# ---------------------------------------------------------
-# 2. 探测 IPv6
-# ---------------------------------------------------------
-# 只保留 scope global，排除 ::1、fe80 等本地地址
-INTERNAL_IPS_V6=$(ip -o -6 addr show \
-    | grep "scope global" \
-    | grep -vE " lo |docker|veth|br-|virbr" \
-    | awk '{print $4}' \
-    | cut -d/ -f1)
-
-if [ -n "$INTERNAL_IPS_V6" ]; then
-    for INT_IP in $INTERNAL_IPS_V6; do
-        PUB_IP=$(curl --interface "$INT_IP" --connect-timeout "$TIMEOUT" -s -6 ifconfig.me)
-
-        if [ -n "$PUB_IP" ]; then
-            SHORT_V6=$(echo "$INT_IP" | awk -F: '{print $NF}')
-            echo -e "[IPv6] 内网 ...$SHORT_V6 \t--> 公网 $PUB_IP"
-            DETECTED_IPS_STRING="$DETECTED_IPS_STRING $PUB_IP"
-        fi
-    done
-else
-    echo "[INFO] 未检测到全球单播 IPv6 地址，已跳过 IPv6 检测"
-fi
-
-if [ -z "$DETECTED_IPS_STRING" ]; then
-    echo "[ERROR] 无法获取任何公网 IP，检查服务器网络或 ifconfig.me 访问情况"
+die() {
+    echo "[ERROR] $*" >&2
     exit 1
-fi
+}
 
-echo "----------------------------------------------------"
-echo "[INFO] 正在提取 Nginx 域名并比对 DNS 解析记录 (A + AAAA)..."
+contains_value() {
+    local needle="$1"
+    shift
 
-# ---------------------------------------------------------
-# 3. 提取 Nginx server_name
-# ---------------------------------------------------------
-# 重点：
-# 1. tr -d '\r' 用于兼容 Windows CRLF，解决 ^M 导致输出错位问题
-# 2. 使用 [[:space:]] 兼容空格和 Tab
-# 3. tr '[:space:]' '\n' 可拆分一行多个 server_name
-# ---------------------------------------------------------
-DOMAIN_LIST=$(nginx -T 2>/dev/null \
-    | tr -d '\r' \
-    | grep -E "^[[:space:]]*server_name[[:space:]]+" \
-    | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/;//g; s/\{//g' \
-    | tr '[:space:]' '\n' \
-    | sed '/^$/d' \
-    | sort -u \
-    | grep -vE "^localhost$|^on$|^off$|^_$|^\*$|^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
-
-if [ -z "$DOMAIN_LIST" ]; then
-    echo "[WARN] 未从 nginx -T 中提取到 server_name"
-    exit 0
-fi
-
-LIST_OK=""
-LIST_FAIL=""
-LIST_SKIP=""
-
-# ---------------------------------------------------------
-# 4. 逐个域名检测 DNS
-# ---------------------------------------------------------
-for DOMAIN in $DOMAIN_LIST; do
-    # 二次兜底：清理隐藏 \r 和前后空格
-    DOMAIN=$(printf '%s' "$DOMAIN" | tr -d '\r' | xargs)
-
-    [ -z "$DOMAIN" ] && continue
-
-    # 跳过通配符域名
-    if echo "$DOMAIN" | grep -q "\*"; then
-        LIST_SKIP="${LIST_SKIP}${DOMAIN}|通配符域名，已跳过\n"
-        continue
-    fi
-
-    # 基础域名格式过滤，避免误把奇怪字符拿去 DNS 查询
-    if ! echo "$DOMAIN" | grep -Eq '^[A-Za-z0-9._-]+$'; then
-        echo -e "[SKIP] $DOMAIN \t域名格式异常，已跳过"
-        LIST_SKIP="${LIST_SKIP}${DOMAIN}|域名格式异常\n"
-        continue
-    fi
-
-    # 同时获取 A / AAAA 解析
-    RESOLVED_IPS=$(getent ahosts "$DOMAIN" \
-        | awk '{print $1}' \
-        | sort -u)
-
-    if [ -z "$RESOLVED_IPS" ]; then
-        echo -e "[FAIL] $DOMAIN \t(无解析记录)"
-        LIST_FAIL="${LIST_FAIL}${DOMAIN}|(无解析)\n"
-        continue
-    fi
-
-    IS_MATCH=0
-    MATCHED_IP=""
-
-    for R_IP in $RESOLVED_IPS; do
-        # 精确匹配本机检测到的公网 IP
-        if echo " $DETECTED_IPS_STRING " | grep -F -q " $R_IP "; then
-            IS_MATCH=1
-            MATCHED_IP="$R_IP"
-            break
+    local item
+    for item in "$@"; do
+        if [[ "$item" == "$needle" ]]; then
+            return 0
         fi
     done
 
-    if [ "$IS_MATCH" -eq 1 ]; then
-        echo -e "[OK]   $DOMAIN \t-> $MATCHED_IP"
-        LIST_OK="${LIST_OK}${DOMAIN}|${MATCHED_IP}\n"
-    else
-        FIRST_IP=$(echo "$RESOLVED_IPS" | head -n 1)
-        ALL_IPS=$(echo "$RESOLVED_IPS" | tr '\n' ',' | sed 's/,$//')
-        echo -e "[FAIL] $DOMAIN \t-> $FIRST_IP (不匹配)"
-        LIST_FAIL="${LIST_FAIL}${DOMAIN}|(IP:${ALL_IPS})\n"
+    return 1
+}
+
+print_records() {
+    local records="$1"
+
+    if [[ -z "$records" ]]; then
+        echo "    无记录"
+        return
+    fi
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] && echo "    $record"
+    done <<< "$records"
+}
+
+print_domain_list() {
+    local title="$1"
+    shift
+
+    echo "$title"
+
+    if [[ "$#" -eq 0 ]]; then
+        echo "  无"
+        return
+    fi
+
+    local item
+    for item in "$@"; do
+        echo "  $item"
+    done
+}
+
+# -------------------------
+# 检查依赖命令
+# -------------------------
+
+for command_name in ip curl dig awk sed grep sort tr xargs; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        die "缺少命令：$command_name"
+
     fi
 done
 
-# ---------------------------------------------------------
-# 5. 最终汇总输出
-# ---------------------------------------------------------
-echo ""
-echo "####################################################"
-echo "                 最终检测报告汇总"
-echo "####################################################"
-
-echo ""
-echo "[OK] 正常域名：已解析到本机 IPv4 / IPv6，建议保留"
-echo "----------------------------------------"
-if [ -z "$LIST_OK" ]; then
-    echo "(无)"
-else
-    echo -e "$LIST_OK" \
-        | sed '/^$/d' \
-        | awk -F'|' '{printf "%-35s %s\n", $1, $2}'
+if ! command -v "$NGINX_BIN" >/dev/null 2>&1; then
+    die "找不到 Nginx 命令：$NGINX_BIN"
 fi
 
-echo ""
-echo "[FAIL] 异常域名：未解析或 IP 不符，建议检查"
-echo "----------------------------------------"
-if [ -z "$LIST_FAIL" ]; then
-    echo "(无)"
-else
-    echo -e "$LIST_FAIL" \
-        | sed '/^$/d' \
-        | awk -F'|' '{printf "%-35s %s\n", $1, $2}'
+# -------------------------
+# 探测本机公网 IPv4 / IPv6
+# -------------------------
+
+echo "[INFO] 正在探测服务器公网 IPv4 / IPv6..."
+echo
+
+DETECTED_IPV4=()
+DETECTED_IPV6=()
+
+# 获取非虚拟网卡的 IPv4 地址
+mapfile -t LOCAL_IPV4 < <(
+    ip -o -4 addr show scope global \
+        | awk '$2 !~ /^(docker|veth|br-|virbr|lo)/ {
+            split($4, addr, "/")
+            print addr[1]
+        }' \
+        | sort -u
+)
+
+# 获取非虚拟网卡的 IPv6 地址
+mapfile -t LOCAL_IPV6 < <(
+    ip -o -6 addr show scope global \
+        | awk '$2 !~ /^(docker|veth|br-|virbr|lo)/ {
+            split($4, addr, "/")
+            print addr[1]
+        }' \
+        | sort -u
+)
+
+# 探测 IPv4 公网地址
+for local_ip in "${LOCAL_IPV4[@]}"; do
+    [[ -z "$local_ip" ]] && continue
+
+    public_ip=$(
+        curl \
+            --interface "$local_ip" \
+            --connect-timeout "$TIMEOUT" \
+            --max-time 8 \
+            --fail \
+            --silent \
+            --show-error \
+            -4 \
+            "$PUBLIC_IP_SERVICE" 2>/dev/null \
+        | tr -d '[:space:]'
+    )
+
+    if [[ "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        if ! contains_value "$public_ip" "${DETECTED_IPV4[@]}"; then
+            DETECTED_IPV4+=("$public_ip")
+        fi
+
+        printf '[IPv4] 本地地址 %-18s -> 公网地址 %s\n' \
+            "$local_ip" "$public_ip"
+    else
+        printf '[IPv4] 本地地址 %-18s -> 获取公网地址失败\n' \
+            "$local_ip"
+    fi
+done
+
+# 探测 IPv6 公网地址
+for local_ip in "${LOCAL_IPV6[@]}"; do
+    [[ -z "$local_ip" ]] && continue
+
+    public_ip=$(
+        curl \
+            --interface "$local_ip" \
+            --connect-timeout "$TIMEOUT" \
+            --max-time 8 \
+            --fail \
+            --silent \
+            --show-error \
+            -6 \
+            "$PUBLIC_IP_SERVICE" 2>/dev/null \
+        | tr -d '[:space:]'
+    )
+
+    if [[ "$public_ip" == *:* ]]; then
+        if ! contains_value "$public_ip" "${DETECTED_IPV6[@]}"; then
+            DETECTED_IPV6+=("$public_ip")
+        fi
+
+        short_ipv6="${local_ip:0:18}"
+        printf '[IPv6] 本地地址 %-18s -> 公网地址 %s\n' \
+            "$short_ipv6..." "$public_ip"
+    else
+        short_ipv6="${local_ip:0:18}"
+        printf '[IPv6] 本地地址 %-18s -> 获取公网地址失败\n' \
+            "$short_ipv6..."
+    fi
+done
+
+echo
+
+if [[ "${#DETECTED_IPV4[@]}" -eq 0 && "${#DETECTED_IPV6[@]}" -eq 0 ]]; then
+    die "无法获取任何公网 IP，请检查网络、默认路由或公网 IP 查询服务"
 fi
 
-echo ""
-echo "[SKIP] 已跳过项目"
-echo "----------------------------------------"
-if [ -z "$LIST_SKIP" ]; then
-    echo "(无)"
+echo "[INFO] 当前检测到的公网 IPv4："
+
+if [[ "${#DETECTED_IPV4[@]}" -eq 0 ]]; then
+    echo "  无"
 else
-    echo -e "$LIST_SKIP" \
-        | sed '/^$/d' \
-        | awk -F'|' '{printf "%-35s %s\n", $1, $2}'
+    for public_ip in "${DETECTED_IPV4[@]}"; do
+        echo "  $public_ip"
+    done
 fi
 
-echo "####################################################"
+echo
+
+echo "[INFO] 当前检测到的公网 IPv6："
+
+if [[ "${#DETECTED_IPV6[@]}" -eq 0 ]]; then
+    echo "  无"
+else
+    for public_ip in "${DETECTED_IPV6[@]}"; do
+        echo "  $public_ip"
+    done
+fi
+
+echo
+echo "========================================================"
+echo "[INFO] 正在读取 Nginx server_name..."
+echo "========================================================"
+
+# -------------------------
+# 读取 Nginx 配置
+# -------------------------
+
+NGINX_CONFIG=""
+
+if ! NGINX_CONFIG="$("$NGINX_BIN" -T 2>/dev/null)"; then
+    die "Nginx 配置检查失败，请执行：$NGINX_BIN -t"
+fi
+
+# 提取 Nginx 中所有 server_name
+DOMAIN_LIST=$(
+    printf '%s\n' "$NGINX_CONFIG" \
+        | tr -d '\r' \
+        | grep -E '^[[:space:]]*server_name[[:space:]]+' \
+        | sed -E '
+            s/^[[:space:]]*server_name[[:space:]]+//
+            s/;//g
+            s/\{//g
+        ' \
+        | tr '[:space:]' '\n' \
+        | sed '/^$/d' \
+        | sort -u \
+        | grep -vE '
+            ^localhost$|
+            ^on$|
+            ^off$|
+            ^_$|
+            ^\*$|
+            ^\$|
+            ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$
+        '
+)
+
+if [[ -z "$DOMAIN_LIST" ]]; then
+    echo "[WARN] 未从 Nginx 配置中提取到 server_name"
+    exit 0
+fi
+
+# -------------------------
+# 结果数组
+# -------------------------
+
+OK_DOMAINS=()
+WARN_DOMAINS=()
+FAIL_DOMAINS=()
+SKIP_DOMAINS=()
+
+DOMAIN_COUNT=0
+
+# -------------------------
+# 逐个域名查询 A / AAAA
+# -------------------------
+
+while IFS= read -r domain; do
+    [[ -z "$domain" ]] && continue
+
+    domain="$(printf '%s' "$domain" | tr -d '\r' | xargs)"
+    [[ -z "$domain" ]] && continue
+
+    # 跳过通配符域名
+    if [[ "$domain" == *"*"* ]]; then
+        echo "[SKIP] $domain"
+        echo "    原因：通配符域名，无法直接进行精确 DNS 比对"
+        echo
+
+        SKIP_DOMAINS+=("$domain")
+        continue
+    fi
+
+    # 只接受常见域名格式
+    if ! printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+        echo "[SKIP] $domain"
+        echo "    原因：域名格式异常"
+        echo
+
+        SKIP_DOMAINS+=("$domain")
+        continue
+    fi
+
+    DOMAIN_COUNT=$((DOMAIN_COUNT + 1))
+
+    # 使用公共 DNS 查询 A 记录
+    IPV4_RECORDS=$(
+        dig +short A "$domain" @"$DNS_IPV4" 2>/dev/null \
+            | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print}' \
+            | sort -u
+    )
+
+    # 使用公共 DNS 查询 AAAA 记录
+    IPV6_RECORDS=$(
+        dig +short AAAA "$domain" @"$DNS_IPV6" 2>/dev/null \
+            | awk '/^[0-9A-Fa-f:]+$/ && /:/ {print}' \
+            | sort -u
+    )
+
+    IPV4_MATCH=0
+    IPV6_MATCH=0
+
+    if [[ -n "$IPV4_RECORDS" ]]; then
+        while IFS= read -r resolved_ip; do
+            if contains_value "$resolved_ip" "${DETECTED_IPV4[@]}"; then
+                IPV4_MATCH=1
+            fi
+        done <<< "$IPV4_RECORDS"
+    fi
+
+    if [[ -n "$IPV6_RECORDS" ]]; then
+        while IFS= read -r resolved_ip; do
+            if contains_value "$resolved_ip" "${DETECTED_IPV6[@]}"; then
+                IPV6_MATCH=1
+            fi
+        done <<< "$IPV6_RECORDS"
+    fi
+
+    IPV4_STATUS="无 A 记录"
+    IPV6_STATUS="无 AAAA 记录"
+
+    if [[ -n "$IPV4_RECORDS" ]]; then
+        if [[ "$IPV4_MATCH" -eq 1 ]]; then
+            IPV4_STATUS="匹配当前服务器公网 IPv4"
+        else
+            IPV4_STATUS="不匹配当前服务器公网 IPv4"
+        fi
+    fi
+
+    if [[ -n "$IPV6_RECORDS" ]]; then
+        if [[ "$IPV6_MATCH" -eq 1 ]]; then
+            IPV6_STATUS="匹配当前服务器公网 IPv6"
+        else
+            IPV6_STATUS="不匹配当前服务器公网 IPv6"
+        fi
+    fi
+
+    # 判断域名总体状态
+    HAS_DNS_RECORD=0
+    HAS_MATCH=0
+    HAS_MISMATCH=0
+
+    if [[ -n "$IPV4_RECORDS" ]]; then
+        HAS_DNS_RECORD=1
+
+        if [[ "$IPV4_MATCH" -eq 1 ]]; then
+            HAS_MATCH=1
+        else
+            HAS_MISMATCH=1
+        fi
+    fi
+
+    if [[ -n "$IPV6_RECORDS" ]]; then
+        HAS_DNS_RECORD=1
+
+        if [[ "$IPV6_MATCH" -eq 1 ]]; then
+            HAS_MATCH=1
+        else
+            HAS_MISMATCH=1
+        fi
+    fi
+
+    if [[ "$HAS_DNS_RECORD" -eq 0 ]]; then
+        DOMAIN_STATUS="FAIL"
+        FAIL_DOMAINS+=("$domain")
+    elif [[ "$HAS_MISMATCH" -eq 0 ]]; then
+        DOMAIN_STATUS="OK"
+        OK_DOMAINS+=("$domain")
+    elif [[ "$HAS_MATCH" -eq 1 ]]; then
+        DOMAIN_STATUS="WARN"
+        WARN_DOMAINS+=("$domain")
+    else
+        DOMAIN_STATUS="FAIL"
+        FAIL_DOMAINS+=("$domain")
+    fi
+
+    echo "--------------------------------------------------------"
+    echo "[$DOMAIN_STATUS] $domain"
+    echo "--------------------------------------------------------"
+
+    echo "  IPv4 A 记录："
+    print_records "$IPV4_RECORDS"
+    echo "  IPv4 状态：$IPV4_STATUS"
+
+    echo
+
+    echo "  IPv6 AAAA 记录："
+    print_records "$IPV6_RECORDS"
+    echo "  IPv6 状态：$IPV6_STATUS"
+
+    echo
+
+done <<< "$DOMAIN_LIST"
+
+# -------------------------
+# 最终汇总
+# -------------------------
+
+echo
+echo "========================================================"
+echo "                    最终检测报告"
+echo "========================================================"
+
+echo
+echo "[OK] IPv4 / IPv6 解析均匹配：${#OK_DOMAINS[@]} 个"
+print_domain_list "" "${OK_DOMAINS[@]}"
+
+echo
+echo "[WARN] 部分解析匹配、部分解析不匹配：${#WARN_DOMAINS[@]} 个"
+print_domain_list "" "${WARN_DOMAINS[@]}"
+
+echo
+echo "[FAIL] 没有任何解析匹配或无解析：${#FAIL_DOMAINS[@]} 个"
+print_domain_list "" "${FAIL_DOMAINS[@]}"
+
+echo
+echo "[SKIP] 跳过检查：${#SKIP_DOMAINS[@]} 个"
+print_domain_list "" "${SKIP_DOMAINS[@]}"
+
+echo
+echo "========================================================"
+echo "[INFO] 共检查域名：$DOMAIN_COUNT 个"
+echo "[INFO] IPv4 DNS 查询服务器：$DNS_IPV4"
+echo "[INFO] IPv6 DNS 查询服务器：$DNS_IPV6"
 echo "[INFO] 检测完成"
+echo "========================================================"
