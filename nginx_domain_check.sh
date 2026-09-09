@@ -316,24 +316,69 @@ fi
 DOMAIN_LIST=$(
     printf '%s\n' "$NGINX_CONFIG" \
         | tr -d '\r' \
-        | grep -E '^[[:space:]]*server_name[[:space:]]+' \
-        | sed -E '
-            s/^[[:space:]]*server_name[[:space:]]+//
-            s/;//g
-            s/\{//g
+        | awk '
+            # 跳过注释行
+            /^[[:space:]]*#/ {
+                next
+            }
+
+            # 只处理真正的 server_name 指令
+            /^[[:space:]]*server_name[[:space:]]+/ {
+                line = $0
+
+                # 删除行首的 server_name
+                sub(/^[[:space:]]*server_name[[:space:]]+/, "", line)
+
+                # 删除行尾分号及其后内容
+                sub(/[;].*$/, "", line)
+
+                # 删除大括号
+                gsub(/[{}]/, "", line)
+
+                # 删除行内注释
+                sub(/[[:space:]]*#.*/, "", line)
+
+                # 按空格拆分多个域名
+                count = split(line, names, /[[:space:]]+/)
+
+                for (i = 1; i <= count; i++) {
+                    domain = names[i]
+
+                    # 清理前后空白
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", domain)
+
+                    # 过滤空值、通配符、变量和无效内容
+                    if (domain == "") {
+                        continue
+                    }
+
+                    if (domain ~ /\*/) {
+                        continue
+                    }
+
+                    if (domain ~ /^\$/) {
+                        continue
+                    }
+
+                    if (domain == "localhost" ||
+                        domain == "on" ||
+                        domain == "off" ||
+                        domain == "_") {
+                        continue
+                    }
+
+                    if (domain ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                        continue
+                    }
+
+                    # 只保留普通域名、子域名和带连字符的域名
+                    if (domain ~ /^[A-Za-z0-9._-]+$/) {
+                        print domain
+                    }
+                }
+            }
         ' \
-        | tr '[:space:]' '\n' \
-        | sed '/^$/d' \
-        | sort -u \
-        | grep -vE '
-            ^localhost$|
-            ^on$|
-            ^off$|
-            ^_$|
-            ^\*$|
-            ^\$.*$|
-            ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$
-        '
+        | sort -u
 )
 
 if [[ -z "$DOMAIN_LIST" ]]; then
